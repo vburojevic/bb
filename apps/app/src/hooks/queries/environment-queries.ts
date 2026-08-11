@@ -65,6 +65,17 @@ interface UseEnvironmentDiffFilesOptions extends QueryOptions {
 const ENVIRONMENT_PULL_REQUEST_STALE_MS = 30_000;
 const ENVIRONMENT_SETTLED_PULL_REQUEST_STALE_MS = 60 * 60_000;
 const ENVIRONMENT_ACTIVE_PULL_REQUEST_REFETCH_MS = 5_000;
+/**
+ * The cycle for an open PR that currently looks settled.
+ *
+ * The fast cycle above can only ever keep a PR fresh that is ALREADY known to
+ * be in flight, because the condition reads the cached copy. That leaves every
+ * ENTRY into flight invisible: push a commit and CI starts, but the cached
+ * copy still says the checks are green, so nothing polls and the row keeps
+ * claiming green until the window happens to regain focus. A reviewer asking
+ * for changes and someone else merging are the same blind spot.
+ */
+const ENVIRONMENT_OPEN_PULL_REQUEST_REFETCH_MS = 30_000;
 const MERGE_BASE_BRANCHES_STALE_MS = 30_000;
 const MERGE_BASE_BRANCHES_LIMIT = 50;
 /** Staleness window for the environment diff TOC query. */
@@ -161,6 +172,8 @@ export function getEnvironmentPullRequestStaleTime(
 export function getEnvironmentPullRequestRefetchInterval(
   pullRequest: ThreadPullRequest | null | undefined,
 ): number | false {
+  // Merged and closed are terminal; an absent PR costs a git-host lookup to
+  // keep confirming it is still absent. Neither earns a cycle.
   if (!pullRequest || pullRequest.state !== "open") {
     return false;
   }
@@ -170,7 +183,10 @@ export function getEnvironmentPullRequestRefetchInterval(
   ) {
     return ENVIRONMENT_ACTIVE_PULL_REQUEST_REFETCH_MS;
   }
-  return false;
+  // Open but quiet. Something has to notice the moment it stops being quiet,
+  // and the fast cycle above cannot: it is gated on a state this PR is not in
+  // yet. This is the cycle that catches the transition INTO flight.
+  return ENVIRONMENT_OPEN_PULL_REQUEST_REFETCH_MS;
 }
 
 export function useEnvironmentPullRequest(

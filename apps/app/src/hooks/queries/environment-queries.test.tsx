@@ -25,6 +25,7 @@ const ENVIRONMENT_ID = "env-1";
 const ACTIVE_PULL_REQUEST_STALE_MS = 30_000;
 const SETTLED_PULL_REQUEST_STALE_MS = 60 * 60_000;
 const ACTIVE_PULL_REQUEST_REFETCH_MS = 5_000;
+const OPEN_PULL_REQUEST_REFETCH_MS = 30_000;
 
 const pullRequestFixture: ThreadPullRequest = {
   number: 128,
@@ -104,12 +105,23 @@ describe("useEnvironmentPullRequest", () => {
     ).toBe(SETTLED_PULL_REQUEST_STALE_MS);
   });
 
+  // The fast cycle can only keep a PR fresh that is ALREADY in flight, since
+  // its condition reads the cached copy. An open PR that currently looks
+  // settled therefore needs a cycle of its own — otherwise pushing a commit
+  // starts CI and nothing ever notices, because the cached copy still says
+  // the checks are green. Same blind spot for a review arriving and for
+  // someone else merging.
+  it("keeps a slow cycle on an open pull request that looks settled", () => {
+    expect(getEnvironmentPullRequestRefetchInterval(pullRequestFixture)).toBe(
+      OPEN_PULL_REQUEST_REFETCH_MS,
+    );
+  });
+
   it("polls open pull requests while checks or mergeability are still settling", () => {
+    // Absent stays unpolled: confirming a PR is still absent costs the same
+    // git-host lookup as fetching a real one.
     expect(getEnvironmentPullRequestRefetchInterval(null)).toBe(false);
     expect(getEnvironmentPullRequestRefetchInterval(undefined)).toBe(false);
-    expect(getEnvironmentPullRequestRefetchInterval(pullRequestFixture)).toBe(
-      false,
-    );
     expect(
       getEnvironmentPullRequestRefetchInterval({
         ...pullRequestFixture,
