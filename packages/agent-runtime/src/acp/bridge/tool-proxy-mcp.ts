@@ -56,7 +56,7 @@ interface JsonRpcMessage {
   params?: unknown;
 }
 
-interface McpServerEnvironment {
+export interface McpServerEnvironment {
   host: string;
   port: number;
   threadId: string;
@@ -107,16 +107,23 @@ function readEnvironment(): McpServerEnvironment {
   };
 }
 
-function writeJson(message: unknown): void {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+/** Outbound side of the MCP stdio channel, injected for tests. */
+export interface McpIo {
+  write(message: unknown): void;
 }
 
-function writeResult(id: string | number, result: unknown): void {
-  writeJson({ jsonrpc: "2.0", id, result });
+const stdoutIo: McpIo = {
+  write: (message) => {
+    process.stdout.write(`${JSON.stringify(message)}\n`);
+  },
+};
+
+function writeResult(io: McpIo, id: string | number, result: unknown): void {
+  io.write({ jsonrpc: "2.0", id, result });
 }
 
-function writeError(id: string | number, code: number, message: string): void {
-  writeJson({ jsonrpc: "2.0", id, error: { code, message } });
+function writeError(io: McpIo, id: string | number, code: number, message: string): void {
+  io.write({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
 function mcpToolCallId(toolName: string): string {
@@ -124,14 +131,70 @@ function mcpToolCallId(toolName: string): string {
   return `acp-mcp-${toolName}-${Date.now()}-${nextMcpToolCallId}`;
 }
 
+/**
+ * Tools that wait on the user (AskUserQuestion and friends) can pend for most
+ * of an hour, but MCP clients default to a 60s request timeout. The protocol's
+ * escape hatch is progress: clients that opt in (`resetTimeoutOnProgress`)
+ * reset that timer on every `notifications/progress` carrying their
+ * progressToken, so one drip per fraction of the default window keeps a
+ * cooperative client's request alive for the whole interaction. Clients that
+ * never sent a token (or never opted in) see nothing — notifications to them
+ * would be noise.
+ */
+const PROGRESS_INTERVAL_MS = 15_000;
+
+function startProgressNotifications(
+  io: McpIo,
+  progressToken: unknown,
+  intervalMs = PROGRESS_INTERVAL_MS,
+): () => void {
+  if (
+    typeof progressToken !== "string" &&
+    typeof progressToken !== "number"
+  ) {
+    return () => {};
+  }
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    io.write({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: {
+        progressToken,
+        progress: Date.now() - startedAt,
+        message: "waiting for the tool call to finish",
+      },
+    });
+  }, intervalMs);
+  // The server must exit when the agent closes stdin, not linger for a timer.
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+interface CancellableBridgeCall {
+  promise: Promise<BridgeToolCallResponse>;
+  /** Notifies the bridge (which unwinds the server-side work) and settles locally. */
+  cancel: () => void;
+}
+
+/**
+ * In-flight tool calls by MCP request id. MCP clients that abandon a request
+ * (timeout, interrupt) send `notifications/cancelled`; without forwarding that,
+ * the server-side work — a question waiting on the user, for instance — keeps
+ * pending for its full budget while the agent has long moved on.
+ */
+const inFlightCalls = new Map<string | number, CancellableBridgeCall>();
+
 function callBridge(
   env: McpServerEnvironment,
   request: Omit<BridgeToolCallRequest, "threadId" | "token">,
-): Promise<BridgeToolCallResponse> {
-  return new Promise((resolve, reject) => {
-    const socket = createConnection({ host: env.host, port: env.port });
-    let buffer = "";
-    socket.setEncoding("utf8");
+): CancellableBridgeCall {
+  const socket = createConnection({ host: env.host, port: env.port });
+  let buffer = "";
+  let rejectPromise: (error: Error) => void = () => {};
+  socket.setEncoding("utf8");
+  const promise = new Promise<BridgeToolCallResponse>((resolve, reject) => {
+    rejectPromise = reject;
     socket.on("connect", () => {
       const payload: BridgeToolCallRequest = {
         ...request,
@@ -161,6 +224,19 @@ function callBridge(
       }
     });
   });
+  // A settled promise ignores the loser, so a late cancel after completion is
+  // a no-op, and a late completion after cancel never surfaces.
+  promise.catch(() => {});
+  const cancel = () => {
+    try {
+      socket.write(`${JSON.stringify({ cancel: request.callId })}\n`);
+    } catch {
+      // The bridge is already gone; the local settle below still applies.
+    }
+    socket.end();
+    rejectPromise(new Error("Tool call cancelled by the agent's MCP client"));
+  };
+  return { promise, cancel };
 }
 
 function objectParams(params: unknown): Record<string, unknown> {
@@ -169,17 +245,31 @@ function objectParams(params: unknown): Record<string, unknown> {
     : {};
 }
 
-async function handleRequest(
+/** Exported for tests; production wiring is `runAcpDynamicToolMcpServer`. */
+export async function handleMcpRequest(
   env: McpServerEnvironment,
   message: JsonRpcMessage,
+  io: McpIo,
+  options?: { progressIntervalMs?: number },
 ): Promise<void> {
-  if (message.id === undefined || message.method === undefined) {
+  if (message.id === undefined) {
+    // Notifications need no response. The only one that matters here is the
+    // client abandoning a request — forward that so the work behind it stops.
+    if (message.method === "notifications/cancelled") {
+      const requestId = objectParams(message.params).requestId;
+      if (typeof requestId === "string" || typeof requestId === "number") {
+        inFlightCalls.get(requestId)?.cancel();
+      }
+    }
+    return;
+  }
+  if (message.method === undefined) {
     return;
   }
 
   switch (message.method) {
     case "initialize":
-      writeResult(message.id, {
+      writeResult(io, message.id, {
         protocolVersion:
           typeof objectParams(message.params).protocolVersion === "string"
             ? objectParams(message.params).protocolVersion
@@ -190,7 +280,7 @@ async function handleRequest(
       return;
 
     case "tools/list":
-      writeResult(message.id, {
+      writeResult(io, message.id, {
         tools: env.tools.map((tool) => ({
           name: tool.name,
           description: tool.description,
@@ -204,7 +294,7 @@ async function handleRequest(
       const name = typeof params.name === "string" ? params.name : "";
       const tool = env.tools.find((candidate) => candidate.name === name);
       if (!tool) {
-        writeError(message.id, -32602, `Unknown tool: ${name}`);
+        writeError(io, message.id, -32602, `Unknown tool: ${name}`);
         return;
       }
       const rawArguments = params.arguments;
@@ -214,25 +304,33 @@ async function handleRequest(
         !Array.isArray(rawArguments)
           ? (rawArguments as Record<string, unknown>)
           : {};
+      const stopProgress = startProgressNotifications(
+        io,
+        objectParams(params._meta).progressToken,
+        options?.progressIntervalMs,
+      );
+      const callId = mcpToolCallId(tool.name);
+      const call = callBridge(env, {
+        arguments: toolArguments,
+        callId,
+        tool: tool.name,
+      });
+      inFlightCalls.set(message.id, call);
       try {
-        const result = await callBridge(env, {
-          arguments: toolArguments,
-          callId: mcpToolCallId(tool.name),
-          tool: tool.name,
-        });
+        const result = await call.promise;
         if (!result.ok) {
-          writeResult(message.id, {
+          writeResult(io, message.id, {
             content: [{ type: "text", text: result.error }],
             isError: true,
           });
           return;
         }
-        writeResult(message.id, {
+        writeResult(io, message.id, {
           content: [{ type: "text", text: result.content }],
           ...(result.isError ? { isError: true } : {}),
         });
       } catch (error) {
-        writeResult(message.id, {
+        writeResult(io, message.id, {
           content: [
             {
               type: "text",
@@ -241,12 +339,16 @@ async function handleRequest(
           ],
           isError: true,
         });
+      } finally {
+        inFlightCalls.delete(message.id);
+        stopProgress();
       }
       return;
     }
 
     default:
       writeError(
+        io,
         message.id,
         -32601,
         `Unsupported MCP method: ${message.method}`,
@@ -268,6 +370,6 @@ export function runAcpDynamicToolMcpServer(): void {
     } catch {
       return;
     }
-    void handleRequest(env, message);
+    void handleMcpRequest(env, message, stdoutIo);
   });
 }

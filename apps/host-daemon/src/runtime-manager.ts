@@ -211,6 +211,7 @@ export interface RuntimeManagerOptions {
     request: PendingInteractionCreate,
   ) => Promise<PendingInteractionResolution>;
   onToolCall?: AgentRuntimeOptions["onToolCall"];
+  onToolCancel?: AgentRuntimeOptions["onToolCancel"];
   onStderr?: AgentRuntimeOptions["onStderr"];
   onProcessExit?: AgentRuntimeOptions["onProcessExit"];
 }
@@ -1084,6 +1085,7 @@ export class RuntimeManager {
           contentItems: [],
           success: true,
         })),
+      onToolCancel: this.options.onToolCancel,
       onInteractiveRequest: this.options.onInteractiveRequest,
       onStderr: this.options.onStderr,
       onProcessExit: (info) => {
@@ -1157,6 +1159,7 @@ export class RuntimeManager {
           contentItems: [],
           success: true,
         })),
+      onToolCancel: this.options.onToolCancel,
       onInteractiveRequest: this.options.onInteractiveRequest,
       onStderr: this.options.onStderr,
       onProcessExit: (info) => {

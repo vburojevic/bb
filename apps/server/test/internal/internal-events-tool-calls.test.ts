@@ -36,6 +36,10 @@ import { withTestHarness } from "../helpers/test-app.js";
 import type { TestAppHarness } from "../helpers/test-app.js";
 import { setPluginAgentContributions } from "../../src/services/plugins/plugin-agent-contributions.js";
 import type { PluginAgentToolRecord } from "../../src/services/plugins/plugin-api.js";
+import {
+  setToolCallHeartbeatIntervalMs,
+  TOOL_CALL_HEARTBEAT_INTERVAL_MS,
+} from "../../src/internal/tool-calls.js";
 
 async function postEventBatch(args: {
   events: HostDaemonEventEnvelope[];
@@ -167,6 +171,111 @@ describe("internal event and tool-call routes", () => {
           });
         }
       } finally {
+        setPluginAgentContributions(undefined);
+      }
+    });
+  });
+
+  it("drips JSON-inert heartbeat whitespace while an interactive tool pends", async () => {
+    await withTestHarness(async (harness) => {
+      const record = {
+        name: "slow_question",
+      } as PluginAgentToolRecord;
+      let completeTool!: (value: ToolCallResponse) => void;
+      const toolResult = new Promise<ToolCallResponse>((resolve) => {
+        completeTool = resolve;
+      });
+      setPluginAgentContributions({
+        listSkillRootContributions: () => [],
+        listAgentTools: () => [],
+        listInstructionContributions: () => [],
+        findAgentTool: (name) =>
+          name === record.name ? { pluginId: "fixture", record } : undefined,
+        invokeAgentTool: () => toolResult,
+        resolveMention: async () => ({ ok: false, error: "unused" }),
+      });
+      setToolCallHeartbeatIntervalMs(30);
+
+      try {
+        const { host, session } = seedHostSession(harness.deps, {
+          id: "host-heartbeat-tool-call",
+        });
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+        });
+        const environment = seedEnvironment(harness.deps, {
+          hostId: host.id,
+          projectId: project.id,
+        });
+        const thread = seedThread(harness.deps, {
+          projectId: project.id,
+          environmentId: environment.id,
+        });
+
+        const server = serve({
+          fetch: harness.app.fetch,
+          hostname: "127.0.0.1",
+          port: 0,
+        });
+        try {
+          if (!server.listening) await once(server, "listening");
+          const address = server.address();
+          if (address === null || typeof address === "string") {
+            throw new Error("Expected a TCP server address");
+          }
+          const response = await fetch(
+            `http://127.0.0.1:${address.port}/internal/session/tool-call`,
+            {
+              method: "POST",
+              headers: internalAuthHeaders(harness),
+              body: JSON.stringify({
+                sessionId: session.id,
+                threadId: thread.id,
+                providerThreadId: "provider-heartbeat",
+                turnId: "turn-heartbeat",
+                callId: "call-heartbeat",
+                tool: record.name,
+              }),
+            },
+          );
+          expect(response.status).toBe(200);
+
+          // While the tool pends, the open body must not go quiet: the first
+          // bytes to arrive are the heartbeat, not the result. Whitespace is
+          // valid JSON padding, so the completed body still parses.
+          const reader = response.body!.getReader();
+          const decoder = new TextDecoder();
+          let early = "";
+          const deadline = Date.now() + 2_000;
+          while (early.length === 0 && Date.now() < deadline) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            early += decoder.decode(value, { stream: true });
+          }
+          expect(early.length).toBeGreaterThan(0);
+          expect(early.trim()).toBe("");
+
+          completeTool({
+            success: true,
+            contentItems: [{ type: "inputText", text: "answered" }],
+          });
+          let rest = "";
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            rest += decoder.decode(value, { stream: true });
+          }
+          expect(JSON.parse(early + rest)).toEqual({
+            success: true,
+            contentItems: [{ type: "inputText", text: "answered" }],
+          });
+        } finally {
+          await new Promise<void>((resolve, reject) => {
+            server.close((error) => (error ? reject(error) : resolve()));
+          });
+        }
+      } finally {
+        setToolCallHeartbeatIntervalMs(TOOL_CALL_HEARTBEAT_INTERVAL_MS);
         setPluginAgentContributions(undefined);
       }
     });

@@ -114,6 +114,12 @@ export interface AgentRuntimeOptions {
    *  `threadId` is always the BB thread id and `providerThreadId` is always present. */
   onToolCall: (request: ToolCallRequest) => Promise<ToolCallResponse>;
 
+  /** Called when a provider reports that the caller abandoned an in-flight
+   *  tool call (e.g. the agent's MCP client timed out), so the work behind it
+   *  — a question waiting on the user, for instance — should stop now instead
+   *  of running its full budget. */
+  onToolCancel?: (callId: string, threadId: string) => void;
+
   /** Called when a provider pauses for user permission or approval.
    *  The runtime converts provider-native requests into bb's shared pending-interaction contract. */
   onInteractiveRequest?: (

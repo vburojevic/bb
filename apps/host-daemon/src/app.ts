@@ -133,6 +133,7 @@ export interface CreateHostDaemonAppOptions {
   threadStorageRootPath?: string;
   hostWatcher?: HostWatcher;
   onToolCall?: (request: ToolCallRequest) => Promise<ToolCallResponse>;
+  onToolCancel?: (callId: string, threadId: string) => void;
   fetchFn?: FetchFn;
   createWebSocket?: CreateReconnectingWebSocket;
   closeMachineAuthProxy?: () => Promise<void>;
@@ -300,6 +301,9 @@ export async function createHostDaemonApp(
     // server must first observe any provider turn/started already emitted.
     await eventSink.flushRequired();
   }
+
+  /** In-flight dynamic tool calls by callId, abortable via onToolCancel. */
+  const inFlightToolCallControllers = new Map<string, AbortController>();
 
   const serverClient = createServerClient({
     serverUrl: options.serverUrl,
@@ -564,26 +568,50 @@ export async function createHostDaemonApp(
     onToolCall:
       options.onToolCall ??
       (async (request) => {
+        // The fetch is abortable so a caller that abandoned the call (an MCP
+        // client timeout, say) stops the server-side work instead of letting
+        // it pend out its full budget. `onToolCancel` fires the controller.
+        const controller = new AbortController();
+        inFlightToolCallControllers.set(request.callId, controller);
         try {
           await flushThreadEventsBeforeToolCall();
           return await runSessionRequest({
             source: "callTool",
-            request: () => serverClient.callTool(request),
+            request: () =>
+              serverClient.callTool(request, { signal: controller.signal }),
           });
         } catch (error) {
-          options.logger.error(
-            {
-              tool: request.tool,
-              threadId: request.threadId,
-              providerThreadId: request.providerThreadId,
-              turnId: request.turnId,
-              callId: request.callId,
-              err: error,
-            },
-            "Failed to forward dynamic tool call to server",
-          );
+          if (controller.signal.aborted) {
+            options.logger.info(
+              {
+                tool: request.tool,
+                threadId: request.threadId,
+                callId: request.callId,
+              },
+              "Dynamic tool call cancelled by the caller",
+            );
+          } else {
+            options.logger.error(
+              {
+                tool: request.tool,
+                threadId: request.threadId,
+                providerThreadId: request.providerThreadId,
+                turnId: request.turnId,
+                callId: request.callId,
+                err: error,
+              },
+              "Failed to forward dynamic tool call to server",
+            );
+          }
           throw error;
+        } finally {
+          inFlightToolCallControllers.delete(request.callId);
         }
+      }),
+    onToolCancel:
+      options.onToolCancel ??
+      ((callId) => {
+        inFlightToolCallControllers.get(callId)?.abort();
       }),
     onInteractiveRequest: async (request) => {
       try {

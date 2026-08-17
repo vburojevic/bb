@@ -50,6 +50,7 @@ export interface HandleRuntimeProviderRequestArgs extends RuntimeProviderRequest
   ) => AgentRuntimeExecutionOptions | undefined;
   onInteractiveRequest: AgentRuntimeOptions["onInteractiveRequest"];
   onToolCall: AgentRuntimeOptions["onToolCall"];
+  onToolCancel?: AgentRuntimeOptions["onToolCancel"];
   resolveThreadId: (
     args: ResolveRuntimeProviderRequestThreadIdArgs,
   ) => string | null;
@@ -383,9 +384,47 @@ function handleInteractiveProviderRequest(
   return true;
 }
 
+/**
+ * `item/tool/cancel` needs no adapter decode and no turn: it is a control
+ * message for a tool call the provider already routed, telling us the caller
+ * abandoned it. Answer immediately; unwinding happens downstream.
+ */
+function handleToolCancelProviderRequest(
+  args: HandleRuntimeProviderRequestArgs,
+): boolean {
+  if (args.parsedMethod !== "item/tool/cancel") {
+    return false;
+  }
+  const params = (args.rawRequest as { params?: unknown }).params;
+  const record =
+    params !== null && typeof params === "object" && !Array.isArray(params)
+      ? (params as Record<string, unknown>)
+      : {};
+  const callId = typeof record.callId === "string" ? record.callId : null;
+  const threadId = typeof record.threadId === "string" ? record.threadId : null;
+  if (callId === null || threadId === null) {
+    sendJsonRpcError({
+      child: args.providerProcess.child,
+      id: args.parsedId,
+      message: `Provider tool-call cancellation requires callId and threadId`,
+    });
+    return true;
+  }
+  args.onToolCancel?.(callId, threadId);
+  sendJsonRpcResult({
+    child: args.providerProcess.child,
+    id: args.parsedId,
+    result: { ok: true },
+  });
+  return true;
+}
+
 export function handleRuntimeProviderRequest(
   args: HandleRuntimeProviderRequestArgs,
 ): void {
+  if (handleToolCancelProviderRequest(args)) {
+    return;
+  }
   if (handleToolCallProviderRequest(args)) {
     return;
   }

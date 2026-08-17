@@ -184,7 +184,10 @@ export interface ServerClient {
   ): Promise<FetchedProjectAttachment>;
   fetchSkillTree(treeHash: string): Promise<HostDaemonSkillTree>;
   postEvents(events: HostDaemonEventEnvelope[]): Promise<EventPostResult>;
-  callTool(request: ToolCallRequest): Promise<HostDaemonToolCallResponse>;
+  callTool(
+    request: ToolCallRequest,
+    options?: { signal?: AbortSignal },
+  ): Promise<HostDaemonToolCallResponse>;
   registerInteractiveRequest(
     request: PendingInteractionCreate,
   ): Promise<HostDaemonInteractiveRequestResponse>;
@@ -463,6 +466,7 @@ export function createServerClient(
 
     async callTool(
       request: ToolCallRequest,
+      callOptions?: { signal?: AbortSignal },
     ): Promise<HostDaemonToolCallResponse> {
       const payload: HostDaemonToolCallRequest = {
         threadId: request.threadId,
@@ -479,6 +483,9 @@ export function createServerClient(
         method: "POST",
         headers: headers(),
         body: JSON.stringify(payload),
+        ...(callOptions?.signal !== undefined
+          ? { signal: callOptions.signal }
+          : {}),
       });
 
       if (!response.ok) {

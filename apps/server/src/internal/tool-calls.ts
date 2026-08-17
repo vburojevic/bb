@@ -21,15 +21,49 @@ import { requireAuthenticatedDaemonSession } from "./session-state.js";
 const textEncoder = new TextEncoder();
 
 /**
+ * Interactive plugin tools can wait on the user for most of an hour. Every
+ * inactivity timer on the daemon→server path must never see the response go
+ * quiet for that long: undici's default 300s headersTimeout used to abort the
+ * daemon's fetch mid-wait (cancelling the interaction with reason
+ * "request-aborted" at ~5 minutes), and proxies/tunnels carry idle timeouts
+ * of their own. One space is valid JSON leading whitespace, so a slow drip
+ * keeps those timers from firing without changing the payload the daemon
+ * parses at completion.
+ */
+export const TOOL_CALL_HEARTBEAT_INTERVAL_MS = 30_000;
+
+let heartbeatIntervalMs = TOOL_CALL_HEARTBEAT_INTERVAL_MS;
+
+/** Test hook: shrink the drip so heartbeat behavior is observable in tests. */
+export function setToolCallHeartbeatIntervalMs(ms: number): void {
+  heartbeatIntervalMs = ms;
+}
+
+/**
  * Return the response head before a plugin tool finishes. Interactive plugin
  * tools can wait for user input for minutes, while bb Connect requires an
  * origin response head within 30 seconds. The response body can stay open.
  */
 function streamToolCallResponse(result: Promise<ToolCallResponse>): Response {
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  const stopHeartbeat = () => {
+    if (heartbeat !== undefined) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+  };
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
+      heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(textEncoder.encode(" "));
+        } catch {
+          stopHeartbeat();
+        }
+      }, heartbeatIntervalMs);
       void result.then(
         (response) => {
+          stopHeartbeat();
           try {
             controller.enqueue(textEncoder.encode(JSON.stringify(response)));
             controller.close();
@@ -37,12 +71,26 @@ function streamToolCallResponse(result: Promise<ToolCallResponse>): Response {
             controller.error(error);
           }
         },
-        (error) => controller.error(error),
+        (error) => {
+          stopHeartbeat();
+          controller.error(error);
+        },
       );
+    },
+    cancel() {
+      stopHeartbeat();
     },
   });
   return new Response(body, {
-    headers: { "content-type": "application/json; charset=UTF-8" },
+    headers: {
+      "content-type": "application/json; charset=UTF-8",
+      // The app's global compress middleware would gzip this stream and hold
+      // the one-byte heartbeats in the compressor's buffer, defeating the
+      // drip (the daemon's client sends accept-encoding: gzip by default).
+      // no-transform is the sanctioned opt-out — and the truth: middleboxes
+      // must not buffer or re-encode a feed whose timing is the point.
+      "cache-control": "no-transform",
+    },
   });
 }
 

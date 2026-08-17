@@ -962,6 +962,7 @@ function createAgentRuntimeInternal(
           threadRuntimeConfigs.get(threadId)?.options,
         onInteractiveRequest: options.onInteractiveRequest,
         onToolCall: options.onToolCall,
+        onToolCancel: options.onToolCancel,
         parsedId: parsedLine.parsedId,
         parsedMethod: parsedLine.parsedMethod,
         providerProcess: proc,

@@ -104,6 +104,53 @@ describe("createAgentRuntime tool calls", () => {
     await runtime.shutdown();
   });
 
+  it("routes item/tool/cancel to onToolCancel and answers ok", async () => {
+    const child = spawn(process.execPath, [
+      "-e",
+      "process.stdin.pipe(process.stdout)",
+    ]);
+    try {
+      const cancels: { callId: string; threadId: string }[] = [];
+      const rawRequest = {
+        jsonrpc: "2.0",
+        id: 77,
+        method: "item/tool/cancel",
+        params: { callId: "call-1", threadId: "t1" },
+      } as const;
+      handleRuntimeProviderRequest({
+        getActiveTurnId: () => null,
+        getThreadExecutionOptions: () => undefined,
+        onInteractiveRequest: async () => ({
+          decision: "deny",
+        }),
+        onToolCall: vi.fn(),
+        onToolCancel: (callId, threadId) => cancels.push({ callId, threadId }),
+        parsedId: rawRequest.id,
+        parsedMethod: rawRequest.method,
+        providerProcess: {
+          adapter: createFakeAdapter(scriptPath),
+          child,
+          interactiveRequestScope: "scope-1",
+        },
+        rawRequest,
+        resolveThreadId: () => "t1",
+      });
+
+      expect(cancels).toEqual([{ callId: "call-1", threadId: "t1" }]);
+      const parsed = parseJsonRpcLine((await readChildStdoutLine(child)).trim());
+      if (parsed.kind !== "response") {
+        throw new Error(`Expected JSON-RPC response, got ${parsed.kind}`);
+      }
+      expect(parsed.parsed).toMatchObject({
+        jsonrpc: "2.0",
+        id: 77,
+        result: { ok: true },
+      });
+    } finally {
+      child.kill();
+    }
+  });
+
   it("resolves unresolved provider tool call turn ids from the active turn", async () => {
     const toolCalls: Array<{
       threadId: string;

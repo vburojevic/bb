@@ -273,31 +273,65 @@ function handleDynamicToolBridgeSocket(
   socket: Socket,
 ): void {
   let buffer = "";
+  let inFlightCallId: string | null = null;
+  let inFlightThreadId: string | null = null;
   socket.setEncoding("utf8");
   socket.on("data", (chunk) => {
     buffer += chunk;
-    const newlineIndex = buffer.indexOf("\n");
-    if (newlineIndex === -1) {
-      return;
+    for (;;) {
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      const line = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+
+      if (inFlightCallId === null) {
+        // First line on a connection is always the tool-call request.
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          socket.end(`${JSON.stringify({ ok: false, error: "Invalid JSON" })}\n`);
+          return;
+        }
+        const request = dynamicToolBridgeRequestSchema.safeParse(parsed);
+        if (!request.success || request.data.token !== bridge.token) {
+          socket.end(
+            `${JSON.stringify({ ok: false, error: "Invalid dynamic tool request" })}\n`,
+          );
+          return;
+        }
+        inFlightCallId = request.data.callId;
+        inFlightThreadId = request.data.threadId;
+        void forwardDynamicToolCall(request.data).then((response) => {
+          socket.end(`${JSON.stringify(response)}\n`);
+        });
+        continue;
+      }
+
+      // Later lines are control frames for the in-flight call. The only one
+      // today is {cancel}: the MCP client abandoned the request (timeout,
+      // interrupt), so unwind the server-side work instead of letting it pend.
+      let frame: unknown;
+      try {
+        frame = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (
+        frame !== null &&
+        typeof frame === "object" &&
+        !Array.isArray(frame) &&
+        (frame as { cancel?: unknown }).cancel === inFlightCallId &&
+        inFlightThreadId !== null
+      ) {
+        void sendRuntimeRequest("item/tool/cancel", {
+          callId: inFlightCallId,
+          threadId: inFlightThreadId,
+        }).catch(() => {});
+      }
     }
-    const line = buffer.slice(0, newlineIndex);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      socket.end(`${JSON.stringify({ ok: false, error: "Invalid JSON" })}\n`);
-      return;
-    }
-    const request = dynamicToolBridgeRequestSchema.safeParse(parsed);
-    if (!request.success || request.data.token !== bridge.token) {
-      socket.end(
-        `${JSON.stringify({ ok: false, error: "Invalid dynamic tool request" })}\n`,
-      );
-      return;
-    }
-    void forwardDynamicToolCall(request.data).then((response) => {
-      socket.end(`${JSON.stringify(response)}\n`);
-    });
   });
 }
 
