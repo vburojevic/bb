@@ -93,6 +93,21 @@ function classifySkillRoot(
     return null;
   }
   const { rootPath } = root;
+  // ACP roots are produced by resolveAcpSkillScanRoots with their origin
+  // already decided; exact paths vary by agent brand group, so match on the
+  // provider prefix rather than enumerating brand dirs here. The path keeps
+  // the seed unique across a brand root and a generic root of the same origin.
+  if (
+    resolution.providerId.startsWith("acp-") &&
+    (root.origin === "project" || root.origin === "user")
+  ) {
+    return {
+      identitySeed:
+        root.skillIdentitySeed ??
+        `${resolution.providerId}:provider-${root.origin}:${rootPath}`,
+      rootKind: root.origin === "project" ? "provider-project" : "provider-user",
+    };
+  }
   if (
     resolution.cwd !== null &&
     (rootPath === path.join(resolution.cwd, ".claude", "skills") ||

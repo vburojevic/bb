@@ -56,7 +56,7 @@ async function makeWorkspaceFixture(): Promise<WorkspaceFixture> {
 
 async function listSkills(
   fixture: WorkspaceFixture,
-  providerId: "claude-code" | "codex",
+  providerId: string,
   cwd: string | null,
 ): Promise<DiscoveredSkill[]> {
   return discoverSkills({
@@ -284,6 +284,85 @@ describe("resolveSkillScanRoots + discoverSkills (codex)", () => {
 
     expect(byName(skills, "linked-directory")?.linked).toBe(true);
     expect(byName(skills, "linked-file")?.linked).toBe(true);
+  });
+});
+
+describe("resolveSkillScanRoots + discoverSkills (acp-kimi)", () => {
+  it("mirrors kimi's first-existing-wins brand order instead of unioning roots", async () => {
+    const fixture = await makeWorkspaceFixture();
+    // Both brand roots exist; kimi loads only ~/.kimi/skills, so the menu
+    // must not offer the shadowed ~/.claude/skills entry.
+    await writeSkill(
+      path.join(fixture.homeDir, ".kimi", "skills", "brand-kimi", "SKILL.md"),
+      "brand-kimi",
+    );
+    await writeSkill(
+      path.join(fixture.homeDir, ".claude", "skills", "shadowed-claude", "SKILL.md"),
+      "shadowed-claude",
+    );
+
+    const skills = await listSkills(fixture, "acp-kimi", fixture.cwd);
+
+    expect(byName(skills, "brand-kimi")?.rootKind).toBe("provider-user");
+    expect(byName(skills, "shadowed-claude")).toBeUndefined();
+  });
+
+  it("falls back through the brand group when earlier roots do not exist", async () => {
+    const fixture = await makeWorkspaceFixture();
+    await writeSkill(
+      path.join(fixture.homeDir, ".claude", "skills", "fallback-claude", "SKILL.md"),
+      "fallback-claude",
+    );
+    await writeSkill(
+      path.join(fixture.cwd, ".codex", "skills", "proj-codex", "SKILL.md"),
+      "proj-codex",
+    );
+
+    const skills = await listSkills(fixture, "acp-kimi", fixture.cwd);
+
+    expect(byName(skills, "fallback-claude")?.rootKind).toBe("provider-user");
+    expect(byName(skills, "proj-codex")?.rootKind).toBe("provider-project");
+  });
+
+  it("scans generic .agents roots for any ACP provider, known brand or not", async () => {
+    const fixture = await makeWorkspaceFixture();
+    await writeSkill(
+      path.join(fixture.cwd, ".agents", "skills", "proj-agents", "SKILL.md"),
+      "proj-agents",
+    );
+    await writeSkill(
+      path.join(fixture.homeDir, ".config", "agents", "skills", "user-config-agents", "SKILL.md"),
+      "user-config-agents",
+    );
+    // An unknown ACP agent has no brand table entry, so a claude-branded root
+    // must NOT leak into its menu.
+    await writeSkill(
+      path.join(fixture.homeDir, ".claude", "skills", "not-for-opencode", "SKILL.md"),
+      "not-for-opencode",
+    );
+
+    const skills = await listSkills(fixture, "acp-opencode", fixture.cwd);
+
+    expect(byName(skills, "proj-agents")?.rootKind).toBe("provider-project");
+    expect(byName(skills, "user-config-agents")?.rootKind).toBe("provider-user");
+    expect(byName(skills, "not-for-opencode")).toBeUndefined();
+  });
+
+  it("drops project roots when cwd is null but keeps user roots", async () => {
+    const fixture = await makeWorkspaceFixture();
+    await writeSkill(
+      path.join(fixture.cwd, ".agents", "skills", "proj-agents", "SKILL.md"),
+      "proj-agents",
+    );
+    await writeSkill(
+      path.join(fixture.homeDir, ".kimi", "skills", "brand-kimi", "SKILL.md"),
+      "brand-kimi",
+    );
+
+    const skills = await listSkills(fixture, "acp-kimi", null);
+
+    expect(byName(skills, "proj-agents")).toBeUndefined();
+    expect(byName(skills, "brand-kimi")?.rootKind).toBe("provider-user");
   });
 });
 

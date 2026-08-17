@@ -1028,6 +1028,91 @@ async function resolveClaudePluginCommandScanRoots(
   return roots;
 }
 
+/**
+ * Skill roots for ACP (Agent Client Protocol) providers, keyed by agent id
+ * (the provider id minus the `acp-` prefix). Each agent discovers skills on
+ * its own, so the typeahead can only mirror what the agent actually loads:
+ * brand-root groups follow the agent's documented first-existing-wins order
+ * rather than a union — listing a shadowed root would offer skills the agent
+ * never sees. The vendor-neutral `.agents` locations apply to every ACP
+ * agent, known or not.
+ */
+const ACP_PROVIDER_ID_PREFIX = "acp-";
+
+const ACP_AGENT_BRAND_DIRS: Record<string, readonly string[]> = {
+  // Kimi Code's documented discovery, first existing root wins per group:
+  // project .kimi/skills → .claude/skills → .codex/skills;
+  // user ~/.kimi/skills → ~/.claude/skills → ~/.codex/skills.
+  kimi: [".kimi", CLAUDE_DIR_NAME, ".codex"],
+};
+
+async function firstExistingDirectory(
+  candidates: readonly string[],
+): Promise<string | null> {
+  for (const candidate of candidates) {
+    try {
+      const stat = await fs.lstat(candidate);
+      if (stat.isDirectory()) {
+        return candidate;
+      }
+    } catch {
+      // Missing or unreadable — try the next candidate.
+    }
+  }
+  return null;
+}
+
+function acpSkillScanRoot(
+  rootPath: string,
+  origin: "project" | "user",
+): CommandScanRoot {
+  return {
+    rootPath,
+    shape: "skill",
+    namePrefix: "",
+    source: "skill",
+    origin,
+  };
+}
+
+async function resolveAcpSkillScanRoots(
+  resolution: CommandRootResolution,
+): Promise<CommandScanRoot[]> {
+  const agentId = resolution.providerId.slice(ACP_PROVIDER_ID_PREFIX.length);
+  const brandDirs = ACP_AGENT_BRAND_DIRS[agentId] ?? [];
+  const roots: CommandScanRoot[] = [];
+
+  if (resolution.cwd !== null) {
+    const projectBrand = await firstExistingDirectory(
+      brandDirs.map((dir) => path.join(resolution.cwd as string, dir, "skills")),
+    );
+    if (projectBrand !== null) {
+      roots.push(acpSkillScanRoot(projectBrand, "project"));
+    }
+    const projectGeneric = await firstExistingDirectory([
+      path.join(resolution.cwd, AGENTS_DIR_NAME, "skills"),
+    ]);
+    if (projectGeneric !== null) {
+      roots.push(acpSkillScanRoot(projectGeneric, "project"));
+    }
+  }
+
+  const userBrand = await firstExistingDirectory(
+    brandDirs.map((dir) => path.join(resolution.homeDir, dir, "skills")),
+  );
+  if (userBrand !== null) {
+    roots.push(acpSkillScanRoot(userBrand, "user"));
+  }
+  const userGeneric = await firstExistingDirectory([
+    path.join(resolution.homeDir, ".config", "agents", "skills"),
+    path.join(resolution.homeDir, AGENTS_DIR_NAME, "skills"),
+  ]);
+  if (userGeneric !== null) {
+    roots.push(acpSkillScanRoot(userGeneric, "user"));
+  }
+  return roots;
+}
+
 export async function resolveProviderCommandScanRoots(
   resolution: CommandRootResolution,
 ): Promise<CommandScanRoot[]> {
@@ -1041,6 +1126,10 @@ export async function resolveProviderCommandScanRoots(
         codexHome: resolution.codexHome,
       })),
     );
+    return roots;
+  }
+  if (resolution.providerId.startsWith(ACP_PROVIDER_ID_PREFIX)) {
+    roots.push(...(await resolveAcpSkillScanRoots(resolution)));
     return roots;
   }
   if (resolution.providerId !== "claude-code") {
