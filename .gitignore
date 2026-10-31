@@ -68,7 +68,9 @@ output.txt
 
 # turborepo
 .turbo
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/skills/
 
 # Temp roots from the CLI packaged-plugin build test (mkdtemp under apps/cli)
 apps/cli/.packaged-plugin-build-*
